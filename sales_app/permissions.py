@@ -1,5 +1,15 @@
 from rest_framework import permissions
-from .models import Permission
+from .models import Permission, Role
+
+def get_all_child_roles(role):
+    
+    if not role:
+        return []
+    children = Role.objects.filter(parent_role=role)
+    result = list(children)
+    for child in children:
+        result.extend(get_all_child_roles(child))
+    return result
 
 class DynamicHierarchicalPermission(permissions.BasePermission):
     def has_permission(self, request, view):
@@ -11,7 +21,7 @@ class DynamicHierarchicalPermission(permissions.BasePermission):
         try:
             model_name = view.queryset.model.__name__
         except AttributeError:
-             return False
+            return False
 
         action = request.method
         
@@ -28,7 +38,7 @@ class DynamicHierarchicalPermission(permissions.BasePermission):
 
         has_perm = Permission.objects.filter(
             role=request.user.role,
-            model_name=model_name,
+            model_name__iexact=model_name, 
             **{perm_type: True}
         ).exists()
 
@@ -40,19 +50,22 @@ class DynamicHierarchicalPermission(permissions.BasePermission):
         if user.role and user.role.name.lower() == 'admin':
             return True
 
-    
+       
         if hasattr(obj, 'created_by') and obj.created_by == user:
             return True
 
-    
-        if hasattr(obj, 'created_by') and obj.created_by:
-             creator_role = obj.created_by.role
-             if creator_role and creator_role.parent_role == user.role:
-                 return True
 
+        if hasattr(obj, 'created_by') and obj.created_by:
+            creator_role = obj.created_by.role
+            child_roles = get_all_child_roles(user.role)
+            
+            
+            if creator_role in child_roles:
+                return True
+        
         if isinstance(obj, type(user)):
              if obj == user: return True
-             if obj.role and obj.role.parent_role == user.role:
+             if obj.role in get_all_child_roles(user.role):
                  return True
 
         return False

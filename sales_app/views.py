@@ -1,40 +1,95 @@
 from django.shortcuts import render
 from rest_framework import viewsets, status
 from rest_framework.response import Response
-from .models import User, Role, Customer, Product, Invoice, InvoiceProduct
-from .serializers import *
-from .validators import * 
-from .permissions import DynamicHierarchicalPermission
+
 from django.db import transaction
 from django.db.models import Q
+from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+#from .models import*
+from .models import User, Role, Customer, Product, Invoice, InvoiceProduct, Permission
+from .serializers import (
+    UserSerializer, RoleSerializer, CustomerSerializer, 
+    ProductSerializer, InvoiceSerializer
+)
+from .validators import (
+    UserValidator, ProductValidator, InvoiceValidator, CustomerValidator
+)
+from .permissions import DynamicHierarchicalPermission, get_all_child_roles
+
+class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
+    def validate(self, attrs):
+        data = super().validate(attrs)
+        user = self.user
+        
+        permissions = []
+        if user.role:
+            perms = Permission.objects.filter(role=user.role)
+            for p in perms:
+                permissions.append({
+                    "model_name": p.model_name,
+                    "read": p.read,
+                    "create": p.create,
+                    "update": p.update,
+                    "delete": p.delete
+                })
+
+        data['user_data'] = {
+            'id': user.id,
+            'name': user.name,
+            'role_name': user.role.name.lower() if user.role else None,
+            'permissions': permissions
+        }
+        return data
+
+class MyTokenObtainPairView(TokenObtainPairView):
+    serializer_class = MyTokenObtainPairSerializer
 
 class BaseSalesViewSet(viewsets.ModelViewSet):
-  
+
     permission_classes = [DynamicHierarchicalPermission]
 
     def get_queryset(self):
         user = self.request.user
         queryset = super().get_queryset()
         
-        if not user.is_authenticated:
+        if not user or not user.is_authenticated:
             return queryset.none()
-        if user.role and user.role.name.lower() == 'admin':
+
+      
+        if user.is_superuser or (user.role and user.role.name.lower() == 'admin'):
             return queryset
-        child_roles = Role.objects.filter(parent_role=user.role)
-        child_users = User.objects.filter(role__in=child_roles)
+
+        model_name = self.queryset.model.__name__
+
+    
+        if model_name in ['Product', 'Customer'] and self.action in ['list', 'retrieve']:
+            return queryset
+
+        
+        child_roles = get_all_child_roles(user.role)
+        child_role_ids = [r.id for r in child_roles]
+        
         return queryset.filter(
-            Q(created_by=user) | Q(created_by__in=child_users)
-        )
+            Q(created_by=user) | 
+            Q(created_by__role_id__in=child_role_ids)
+        ).distinct()
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        serializer.save(updated_by=self.request.user)
+
+
+
 
 class UserViewSet(BaseSalesViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
 
     def create(self, request, *args, **kwargs):
-        
+
         validator = UserValidator(request.data)
         if not validator.is_valid():
             return Response(validator.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -42,8 +97,8 @@ class UserViewSet(BaseSalesViewSet):
 
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
-        validator = UserValidator(request.data, instance_id=instance.id)
-        if not validator.is_valid():
+        validator = UserValidator(request.data)
+        if not validator.is_valid(exclude_id=instance.id):
             return Response(validator.errors, status=status.HTTP_400_BAD_REQUEST)
         return super().update(request, *args, **kwargs)
 
@@ -52,15 +107,27 @@ class RoleViewSet(BaseSalesViewSet):
     serializer_class = RoleSerializer
 
     def perform_create(self, serializer):
-        user = self.request.user
-        parent = None
-        
-        if user.role.name.lower() == 'admin':
-            parent = user.role 
-        else:
-            parent = user.role
-            
-        serializer.save(created_by=user, parent_role=parent)
+        serializer.save(
+            created_by=self.request.user, 
+            parent_role=self.request.user.role
+        )
+
+class CustomerViewSet(BaseSalesViewSet):
+    queryset = Customer.objects.all()
+    serializer_class = CustomerSerializer
+    
+    def create(self, request, *args, **kwargs):
+        validator = CustomerValidator(request.data)
+        if not validator.is_valid():
+            return Response(validator.errors, status=status.HTTP_400_BAD_REQUEST)
+        return super().create(request, *args, **kwargs)
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        validator = CustomerValidator(request.data)
+        if not validator.is_valid(exclude_id=instance.id):
+            return Response(validator.errors, status=status.HTTP_400_BAD_REQUEST)
+        return super().update(request, *args, **kwargs)
 
 class ProductViewSet(BaseSalesViewSet):
     queryset = Product.objects.all()
@@ -72,59 +139,79 @@ class ProductViewSet(BaseSalesViewSet):
             return Response(validator.errors, status=status.HTTP_400_BAD_REQUEST)
         return super().create(request, *args, **kwargs)
 
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        validator = ProductValidator(request.data)
+        if not validator.is_valid(exclude_id=instance.id):
+            return Response(validator.errors, status=status.HTTP_400_BAD_REQUEST)
+        return super().update(request, *args, **kwargs)
+
 class InvoiceViewSet(BaseSalesViewSet):
     queryset = Invoice.objects.all()
     serializer_class = InvoiceSerializer
 
     def create(self, request, *args, **kwargs):
-       
+
         validator = InvoiceValidator(request.data)
         if not validator.is_valid():
             return Response(validator.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        with transaction.atomic():
-            customer_id = request.data.get('customer_id')
-            invoice = Invoice.objects.create(
-                customer_id=customer_id,
-                created_by=request.user,
-                status='pending' 
-            )
-
-            total_amount = 0
-            items_data = request.data.get('items')
-            
-            for item in items_data:
-                product = Product.objects.get(id=item['product_id'])
-                qty = int(item['quantity'])
-                amount = product.price * qty
+        try:
+            with transaction.atomic():
+                customer_obj = Customer.objects.get(id=request.data.get('customer_id'))
                 
-                InvoiceProduct.objects.create(
-                    invoice=invoice,
-                    product=product,
-                    quantity=qty,
-                    amount=amount,
-                    created_by=request.user
+                invoice = Invoice.objects.create(
+                    customer=customer_obj,
+                    created_by=request.user,
+                    status='pending' 
                 )
-                
-            
-                product.quantity -= qty
-                product.save()
-                
-                total_amount += amount
 
-            invoice.total_amount = total_amount
-            invoice.save()
+                total_amount = 0
+                items_data = request.data.get('items', [])
+                
+                for item in items_data:
+                    product = Product.objects.select_for_update().get(id=item['product_id'])
+                    qty = int(item['quantity'])
+                    
+                    if product.quantity < qty:
+                        raise ValueError(f"Insufficient stock for product: {product.name}")
 
-            serializer = self.get_serializer(invoice)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
+                    line_amount = product.price * qty
+                    InvoiceProduct.objects.create(
+                        invoice=invoice,
+                        product=product,
+                        quantity=qty,
+                        amount=line_amount,
+                        created_by=request.user
+                    )
+                    
+
+                    product.quantity -= qty
+                    product.save()
+                    total_amount += line_amount
+
+                invoice.total_amount = total_amount
+                invoice.save()
+
+                serializer = self.get_serializer(invoice)
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except Exception as e:
+            return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     def update(self, request, *args, **kwargs):
-    
+
         user = request.user
         allowed_roles = ['admin', 'sales manager']
-        
-        if user.role and user.role.name.lower() not in allowed_roles:
-             if 'status' in request.data:
-                 return Response({"error": "Only Managers can update invoice status"}, status=403)
+        user_role_name = user.role.name.lower() if user.role else ""
+
+        if 'status' in request.data:
+            new_status = request.data['status']
+            if new_status in ['paid', 'refused']:
+                 is_manager = 'sales manager' in user_role_name or 'admin' == user_role_name
+                 if not is_manager:
+                     return Response(
+                        {"error": "Permission Denied: Only Managers can change invoice status to Paid/Refused."}, 
+                        status=status.HTTP_403_FORBIDDEN
+                    )
         
         return super().update(request, *args, **kwargs)
