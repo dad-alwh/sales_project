@@ -8,16 +8,38 @@ AUDIT_FIELDS = ['created_at', 'created_by', 'updated_at', 'updated_by']
 class PermissionSerializer(serializers.ModelSerializer):
     class Meta:
         model = Permission
-        fields = ['id', 'model_name', 'create', 'read', 'update', 'delete', 'role'] + AUDIT_FIELDS
-        read_only_fields = AUDIT_FIELDS
+        fields = ['id', 'model_name', 'create', 'read', 'update', 'delete']
 
 class RoleSerializer(serializers.ModelSerializer):
-    permissions = PermissionSerializer(many=True, read_only=True)
+    permissions = PermissionSerializer(many=True)
     
     class Meta:
         model = Role
         fields = ['id', 'name', 'parent_role', 'status', 'permissions'] + AUDIT_FIELDS
         read_only_fields = ['parent_role'] + AUDIT_FIELDS 
+
+    def create(self, validated_data):
+        permissions_data = validated_data.pop('permissions', [])
+        role = Role.objects.create(**validated_data)
+        
+        for perm_data in permissions_data:
+            Permission.objects.create(role=role, **perm_data)
+            
+        return role
+
+    def update(self, instance, validated_data):
+        permissions_data = validated_data.pop('permissions', None)
+        
+        instance.name = validated_data.get('name', instance.name)
+        instance.status = validated_data.get('status', instance.status)
+        instance.save()
+
+        if permissions_data is not None:
+            instance.permissions.all().delete()
+            for perm_data in permissions_data:
+                Permission.objects.create(role=instance, **perm_data)
+        
+        return instance
 
 class UserSerializer(serializers.ModelSerializer):
     role_name = serializers.ReadOnlyField(source='role.name')
@@ -63,10 +85,9 @@ class InvoiceProductSerializer(serializers.ModelSerializer):
     class Meta:
         model = InvoiceProduct
         fields = ['id', 'product', 'product_name', 'quantity', 'amount'] + AUDIT_FIELDS
-        read_only_fields = AUDIT_FIELDS
+        read_only_fields = ['amount'] + AUDIT_FIELDS
 
 class InvoiceSerializer(serializers.ModelSerializer):
-    
     items = InvoiceProductSerializer(many=True, read_only=True)
     customer_name = serializers.ReadOnlyField(source='customer.name')
     created_by_name = serializers.ReadOnlyField(source='created_by.name')
