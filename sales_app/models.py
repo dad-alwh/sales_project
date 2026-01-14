@@ -87,7 +87,11 @@ class Permission(BaseModel):
     read = models.BooleanField(default=False)
     update = models.BooleanField(default=False)
     delete = models.BooleanField(default=False)
-
+    def save(self, *args, **kwargs):
+        # Always lower case model name to avoid mismatches
+        if self.model_name:
+            self.model_name = self.model_name.lower()
+        super().save(*args, **kwargs)
     def __str__(self):
         return f"{self.role} -> {self.model_name}"
 
